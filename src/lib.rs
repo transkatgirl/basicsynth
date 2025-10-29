@@ -1,29 +1,15 @@
 use nih_plug::{prelude::*, util::db_to_gain};
-use std::{f32::consts::TAU, sync::Arc};
+use std::{collections::VecDeque, f32::consts::TAU, sync::Arc};
 
 // ! This needs a lot of code cleanup; many comments are incorrect
 
-/// The number of simultaneous voices for this synth.
-const NUM_VOICES: u32 = 128;
 /// The maximum size of an audio block. We'll split up the audio in blocks and render smoothed
 /// values to buffers since these values may need to be reused for multiple voices.
 const MAX_BLOCK_SIZE: usize = 64;
 
-// Polyphonic modulation works by assigning integer IDs to parameters. Pattern matching on these in
-// `PolyModulation` and `MonoAutomation` events makes it possible to easily link these events to the
-// correct parameter.
-const GAIN_POLY_MOD_ID: u32 = 0;
-
-/// A simple polyphonic synthesizer with support for CLAP's polyphonic modulation. See
-/// `NoteEvent::PolyModulation` for another source of information on how to use this.
-struct PolyModSynth {
+pub struct PolyModSynth {
     params: Arc<PolyModSynthParams>,
-
-    /// The synth's voices. Inactive voices will be set to `None` values.
-    voices: [Option<Voice>; NUM_VOICES as usize],
-    /// The next internal voice ID, used only to figure out the oldest voice for voice stealing.
-    /// This is incremented by one each time a voice is created.
-    next_internal_voice_id: u64,
+    voices: Vec<Voice>,
 }
 
 #[derive(Params)]
@@ -34,43 +20,36 @@ struct PolyModSynthParams {
     velocity_range: FloatParam,
 }
 
-/// Data for a single synth voice. In a real synth where performance matter, you may want to use a
-/// struct of arrays instead of having a struct for each voice.
 #[derive(Debug, Clone)]
 struct Voice {
-    /// The identifier for this voice. Polyphonic modulation events are linked to a voice based on
-    /// these IDs. If the host doesn't provide these IDs, then this is computed through
-    /// `compute_fallback_voice_id()`. In that case polyphonic modulation will not work, but the
-    /// basic note events will still have an effect.
-    voice_id: i32,
-    /// The note's channel, in `0..16`. Only used for the voice terminated event.
-    channel: u8,
-    /// The note's key/note, in `0..128`. Only used for the voice terminated event.
+    active: bool,
     note: u8,
-    /// The voices internal ID. Each voice has an internal voice ID one higher than the previous
-    /// voice. This is used to steal the last voice in case all 16 voices are in use.
-    internal_voice_id: u64,
-    /// This is used as a gain multiplier.
-    velocity_multiplier: f32,
-
-    /// The voice's current phase.
+    channel: u8,
+    frequency: f32,
+    velocities: VecDeque<(u32, f32)>,
+    pannings: VecDeque<(u32, f32)>,
+    gains: VecDeque<(u32, f32)>,
     phase: f32,
-    /// The phase increment. This is based on the voice's frequency, derived from the note index.
-    /// Since we don't support pitch expressions or pitch bend, this value stays constant for the
-    /// duration of the voice.
-    phase_delta: f32,
-
-    gain: f32,
 }
 
 impl Default for PolyModSynth {
     fn default() -> Self {
         Self {
             params: Arc::new(PolyModSynthParams::default()),
-
-            // `[None; N]` requires the `Some(T)` to be `Copy`able
-            voices: [0; NUM_VOICES as usize].map(|_| None),
-            next_internal_voice_id: 0,
+            voices: (0..16)
+                .flat_map(|channel| {
+                    (0..127).map(move |note| Voice {
+                        active: false,
+                        note,
+                        channel,
+                        frequency: util::midi_note_to_freq(note),
+                        velocities: VecDeque::with_capacity(65535),
+                        pannings: VecDeque::with_capacity(65535),
+                        gains: VecDeque::with_capacity(65535),
+                        phase: 0.0,
+                    })
+                })
+                .collect(),
         }
     }
 }
@@ -80,20 +59,19 @@ impl Default for PolyModSynthParams {
         Self {
             gain: FloatParam::new(
                 "Gain",
-                1.0 / NUM_VOICES as f32,
+                1.0 / 128.0,
                 FloatRange::Skewed {
                     min: util::db_to_gain(-100.0),
                     max: util::db_to_gain(0.0),
                     factor: FloatRange::gain_skew_factor(-100.0, 0.0),
                 },
             )
-            .with_poly_modulation_id(GAIN_POLY_MOD_ID)
             .with_unit(" dB")
             .with_value_to_string(formatters::v2s_f32_gain_to_db(2))
             .with_string_to_value(formatters::s2v_f32_gain_to_db()),
             velocity_range: FloatParam::new(
                 "Velocity Range",
-                50.0,
+                40.0,
                 FloatRange::Linear {
                     min: 0.0,
                     max: 100.0,
@@ -133,8 +111,9 @@ impl Plugin for PolyModSynth {
     // `context.set_current_voice_capacity()` in `initialize()` and in `process()` (when the
     // capacity changes) to inform the host about this.
     fn reset(&mut self) {
-        self.voices.fill(None);
-        self.next_internal_voice_id = 0;
+        for voice in &mut self.voices {
+            voice.active = false;
+        }
     }
 
     fn process(
@@ -173,101 +152,63 @@ impl Plugin for PolyModSynth {
                         match event {
                             NoteEvent::NoteOn {
                                 timing,
-                                voice_id,
+                                voice_id: _,
                                 channel,
                                 note,
                                 velocity,
                             } => {
-                                // This starts with the attack portion of the amplitude envelope
-
-                                let voice = self.start_voice(
-                                    context,
-                                    timing,
-                                    sample_rate,
-                                    voice_id,
-                                    channel,
-                                    note,
-                                );
-                                voice.velocity_multiplier = db_to_gain(map_value_f32(
-                                    velocity,
-                                    0.0,
-                                    1.0,
-                                    -velocity_range,
-                                    0.0,
-                                ));
+                                let voice = self.start_voice(context, timing, channel, note);
+                                voice.velocities.push_back((timing, velocity));
+                            }
+                            NoteEvent::PolyPressure {
+                                timing,
+                                voice_id: _,
+                                channel,
+                                note,
+                                pressure,
+                            } => {
+                                let voice =
+                                    &mut self.voices[(channel as usize * 128) + note as usize];
+                                voice.velocities.push_back((timing, pressure));
+                            }
+                            NoteEvent::PolyVolume {
+                                timing,
+                                voice_id: _,
+                                channel,
+                                note,
+                                gain,
+                            } => {
+                                let voice =
+                                    &mut self.voices[(channel as usize * 128) + note as usize];
+                                voice.gains.push_back((timing, gain));
+                            }
+                            NoteEvent::PolyPan {
+                                timing,
+                                voice_id: _,
+                                channel,
+                                note,
+                                pan,
+                            } => {
+                                let voice =
+                                    &mut self.voices[(channel as usize * 128) + note as usize];
+                                voice.pannings.push_back((timing, pan));
                             }
                             NoteEvent::NoteOff {
                                 timing,
-                                voice_id,
+                                voice_id: _,
                                 channel,
                                 note,
                                 velocity: _,
                             } => {
-                                self.stop_voices(context, timing, voice_id, channel, note);
+                                self.stop_voices(context, timing, channel, note);
                             }
                             NoteEvent::Choke {
                                 timing,
-                                voice_id,
+                                voice_id: _,
                                 channel,
                                 note,
                             } => {
-                                self.stop_voices(context, timing, voice_id, channel, note);
-                            }
-                            NoteEvent::PolyModulation {
-                                timing: _,
-                                voice_id,
-                                poly_modulation_id,
-                                normalized_offset,
-                            } => {
-                                // Polyphonic modulation events are matched to voices using the
-                                // voice ID, and to parameters using the poly modulation ID. The
-                                // host will probably send a modulation event every N samples. This
-                                // will happen before the voice is active, and of course also after
-                                // it has been terminated (because the host doesn't know that it
-                                // will be). Because of that, we won't print any assertion failures
-                                // when we can't find the voice index here.
-                                if let Some(voice_idx) = self.get_voice_idx(voice_id) {
-                                    let voice = self.voices[voice_idx].as_mut().unwrap();
-
-                                    match poly_modulation_id {
-                                        GAIN_POLY_MOD_ID => {
-                                            // This should either create a smoother for this
-                                            // modulated parameter or update the existing one.
-                                            // Notice how this uses the parameter's unmodulated
-                                            // normalized value in combination with the normalized
-                                            // offset to create the target plain value
-                                            //self.params.gain.preview_modulated(normalized_offset);
-                                            voice.gain = normalized_offset;
-                                        }
-                                        n => nih_debug_assert_failure!(
-                                            "Polyphonic modulation sent for unknown poly \
-                                             modulation ID {}",
-                                            n
-                                        ),
-                                    }
-                                }
-                            }
-                            NoteEvent::MonoAutomation {
-                                timing: _,
-                                poly_modulation_id,
-                                normalized_value,
-                            } => {
-                                // Modulation always acts as an offset to the parameter's current
-                                // automated value. So if the host sends a new automation value for
-                                // a modulated parameter, the modulated values/smoothing targets
-                                // need to be updated for all polyphonically modulated voices.
-                                for voice in self.voices.iter_mut().filter_map(|v| v.as_mut()) {
-                                    match poly_modulation_id {
-                                        GAIN_POLY_MOD_ID => {
-                                            voice.gain = normalized_value;
-                                        }
-                                        n => nih_debug_assert_failure!(
-                                            "Automation event sent for unknown poly modulation ID \
-                                             {}",
-                                            n
-                                        ),
-                                    }
-                                }
+                                self.stop_voices(context, timing, channel, note);
                             }
                             _ => (),
                         };
@@ -290,18 +231,57 @@ impl Plugin for PolyModSynth {
 
             let global_gain = self.params.gain.value();
 
-            for voice in self.voices.iter_mut().filter_map(|v| v.as_mut()) {
+            for voice in self.voices.iter_mut() {
+                if !voice.active {
+                    continue;
+                }
+
                 for sample_idx in block_start..block_end {
-                    let amp = voice.velocity_multiplier * voice.gain * global_gain;
+                    while voice.gains.len() > 1 && voice.gains[1].0 > sample_idx as u32 {
+                        voice.gains.pop_front();
+                    }
+
+                    while voice.velocities.len() > 1 && voice.velocities[1].0 > sample_idx as u32 {
+                        voice.velocities.pop_front();
+                    }
+
+                    while voice.pannings.len() > 1 && voice.pannings[1].0 > sample_idx as u32 {
+                        voice.pannings.pop_front();
+                    }
+
+                    let gain = if !voice.gains.is_empty() {
+                        voice.gains[0].1
+                    } else {
+                        1.0
+                    };
+
+                    let velocity = if !voice.velocities.is_empty() {
+                        voice.velocities[0].1
+                    } else {
+                        1.0
+                    };
+
+                    let pan = if !voice.pannings.is_empty() {
+                        voice.pannings[0].1
+                    } else {
+                        0.0
+                    };
+
+                    let velocity_multiplier =
+                        db_to_gain(map_value_f32(velocity, 0.0, 1.0, -velocity_range, 0.0));
+
+                    let amp = velocity_multiplier * gain * global_gain;
                     let sample = (voice.phase * TAU).sin() * amp;
 
-                    voice.phase += voice.phase_delta;
+                    voice.phase += voice.frequency / sample_rate;
                     if voice.phase >= 1.0 {
                         voice.phase -= 1.0;
                     }
 
-                    output[0][sample_idx] += sample;
-                    output[1][sample_idx] += sample;
+                    let (left, right) = constant_power_pan(sample, pan);
+
+                    output[0][sample_idx] += left;
+                    output[1][sample_idx] += right;
                 }
             }
 
@@ -315,122 +295,64 @@ impl Plugin for PolyModSynth {
 }
 
 impl PolyModSynth {
-    /// Get the index of a voice by its voice ID, if the voice exists. This does not immediately
-    /// return a reference to the voice to avoid lifetime issues.
-    fn get_voice_idx(&mut self, voice_id: i32) -> Option<usize> {
-        self.voices
-            .iter_mut()
-            .position(|voice| matches!(voice, Some(voice) if voice.voice_id == voice_id))
-    }
-
-    /// Start a new voice with the given voice ID. If all voices are currently in use, the oldest
-    /// voice will be stolen. Returns a reference to the new voice.
     fn start_voice(
         &mut self,
-        context: &mut impl ProcessContext<Self>,
-        sample_offset: u32,
-        sample_rate: f32,
-        voice_id: Option<i32>,
+        _context: &mut impl ProcessContext<Self>,
+        _sample_offset: u32,
         channel: u8,
         note: u8,
     ) -> &mut Voice {
-        let new_voice = Voice {
-            voice_id: voice_id.unwrap_or_else(|| compute_fallback_voice_id(note, channel)),
-            internal_voice_id: self.next_internal_voice_id,
-            channel,
-            note,
-            velocity_multiplier: 1.0,
+        let voice = &mut self.voices[(channel as usize * 128) + note as usize];
 
-            phase: 0.0,
-            phase_delta: util::midi_note_to_freq(note) / sample_rate,
+        assert_eq!(voice.channel, channel);
+        assert_eq!(voice.note, note);
 
-            gain: 1.0,
-        };
-        self.next_internal_voice_id = self.next_internal_voice_id.wrapping_add(1);
+        voice.active = true;
+        voice.velocities.clear();
+        voice.pannings.clear();
+        voice.gains.clear();
 
-        // Can't use `.iter_mut().find()` here because nonlexical lifetimes don't apply to return
-        // values
-        match self.voices.iter().position(|voice| voice.is_none()) {
-            Some(free_voice_idx) => {
-                self.voices[free_voice_idx] = Some(new_voice);
-                self.voices[free_voice_idx].as_mut().unwrap()
-            }
-            None => {
-                // If there is no free voice, find and steal the oldest one
-                // SAFETY: We can skip a lot of checked unwraps here since we already know all voices are in
-                //         use
-                let oldest_voice = unsafe {
-                    self.voices
-                        .iter_mut()
-                        .min_by_key(|voice| voice.as_ref().unwrap_unchecked().internal_voice_id)
-                        .unwrap_unchecked()
-                };
-
-                // The stolen voice needs to be terminated so the host can reuse its modulation
-                // resources
-                {
-                    let oldest_voice = oldest_voice.as_ref().unwrap();
-                    context.send_event(NoteEvent::VoiceTerminated {
-                        timing: sample_offset,
-                        voice_id: Some(oldest_voice.voice_id),
-                        channel: oldest_voice.channel,
-                        note: oldest_voice.note,
-                    });
-                }
-
-                *oldest_voice = Some(new_voice);
-                oldest_voice.as_mut().unwrap()
-            }
-        }
+        voice
     }
-    /// Immediately terminate one or more voice, removing it from the pool and informing the host
-    /// that the voice has ended. If `voice_id` is not provided, then this will terminate all
-    /// matching voices.
     fn stop_voices(
         &mut self,
         context: &mut impl ProcessContext<Self>,
         sample_offset: u32,
-        voice_id: Option<i32>,
         channel: u8,
         note: u8,
     ) {
-        for voice in self.voices.iter_mut() {
-            match voice {
-                Some(Voice {
-                    voice_id: candidate_voice_id,
-                    channel: candidate_channel,
-                    note: candidate_note,
-                    ..
-                }) if voice_id == Some(*candidate_voice_id)
-                    || (channel == *candidate_channel && note == *candidate_note) =>
-                {
-                    context.send_event(NoteEvent::VoiceTerminated {
-                        timing: sample_offset,
-                        // Notice how we always send the terminated voice ID here
-                        voice_id: Some(*candidate_voice_id),
-                        channel,
-                        note,
-                    });
-                    *voice = None;
+        let voice = &mut self.voices[(channel as usize * 128) + note as usize];
 
-                    if voice_id.is_some() {
-                        return;
-                    }
-                }
-                _ => (),
-            }
-        }
+        assert_eq!(voice.channel, channel);
+        assert_eq!(voice.note, note);
+
+        context.send_event(NoteEvent::VoiceTerminated {
+            timing: sample_offset,
+            voice_id: Some((channel as i32 * 128) + note as i32),
+            channel,
+            note,
+        });
+
+        voice.active = false;
+        voice.phase = 0.0;
     }
 }
 
-pub fn map_value_f32(x: f32, min: f32, max: f32, target_min: f32, target_max: f32) -> f32 {
+fn map_value_f32(x: f32, min: f32, max: f32, target_min: f32, target_max: f32) -> f32 {
     (x - min) / (max - min) * (target_max - target_min) + target_min
 }
 
-/// Compute a voice ID in case the host doesn't provide them. Polyphonic modulation will not work in
-/// this case, but playing notes will.
-const fn compute_fallback_voice_id(note: u8, channel: u8) -> i32 {
-    note as i32 | ((channel as i32) << 16)
+fn constant_power_pan(value: f32, pan: f32) -> (f32, f32) {
+    if pan == 0.0 {
+        (value, value)
+    } else {
+        let angle = (pan * 2.0 * 45.0).to_radians();
+        let coeff = f32::sqrt(2.0) / 2.0;
+        let cos = f32::cos(angle);
+        let sin = f32::sin(angle);
+
+        (coeff * (cos - sin) * value, coeff * (cos + sin) * value)
+    }
 }
 
 impl ClapPlugin for PolyModSynth {
@@ -443,11 +365,6 @@ impl ClapPlugin for PolyModSynth {
         ClapFeature::Synthesizer,
         ClapFeature::Stereo,
     ];
-
-    const CLAP_POLY_MODULATION_CONFIG: Option<PolyModulationConfig> = Some(PolyModulationConfig {
-        max_voice_capacity: NUM_VOICES,
-        supports_overlapping_voices: true,
-    });
 }
 
 impl Vst3Plugin for PolyModSynth {

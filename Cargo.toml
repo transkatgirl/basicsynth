@@ -11,11 +11,12 @@ members = [
 [lib]
 crate-type = [
 	"cdylib",
+	"lib",
 ]
 
 [dependencies]
 nih_plug = { git = "https://github.com/transkatgirl/nih-plug.git", rev = "1f132feff0b03df8b5078ffaa1087201c9545d3f", features = [
-	"assert_process_allocs",
+	#"assert_process_allocs",
 	"standalone",
 ] }
 nih_plug_egui = { git = "https://github.com/transkatgirl/nih-plug.git", rev = "1f132feff0b03df8b5078ffaa1087201c9545d3f" }
