@@ -31,6 +31,7 @@ struct Voice {
     active: bool,
     note: u8,
     channel: u8,
+    voice_id: Option<i32>,
     frequency: f32,
     velocity: f32,
     pan: f32,
@@ -48,6 +49,7 @@ impl Default for PolyModSynth {
                         active: false,
                         note,
                         channel,
+                        voice_id: None,
                         frequency: util::midi_note_to_freq(note),
                         velocity: 0.0,
                         pan: 0.0,
@@ -160,12 +162,13 @@ impl Plugin for PolyModSynth {
                         match event {
                             NoteEvent::NoteOn {
                                 timing,
-                                voice_id: _,
+                                voice_id,
                                 channel,
                                 note,
                                 velocity,
                             } => {
-                                let voice = self.start_voice(context, timing, channel, note);
+                                let voice =
+                                    self.start_voice(context, timing, channel, note, voice_id);
                                 voice.velocity = velocity;
                             }
                             NoteEvent::PolyPressure {
@@ -304,12 +307,14 @@ impl PolyModSynth {
         _sample_offset: u32,
         channel: u8,
         note: u8,
+        voice_id: Option<i32>,
     ) -> &mut Voice {
         let voice = &mut self.voices[(channel as usize * 128) + note as usize];
 
         debug_assert_eq!(voice.channel, channel);
         debug_assert_eq!(voice.note, note);
 
+        voice.voice_id = voice_id;
         voice.active = true;
         voice.velocity = 0.0;
         voice.pan = 0.0;
@@ -331,7 +336,7 @@ impl PolyModSynth {
 
         context.send_event(NoteEvent::VoiceTerminated {
             timing: sample_offset,
-            voice_id: Some((channel as i32 * 128) + note as i32),
+            voice_id: voice.voice_id,
             channel,
             note,
         });
