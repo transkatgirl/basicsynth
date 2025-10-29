@@ -34,7 +34,7 @@ struct Voice {
     frequency: f32,
     velocity: f32,
     pan: f32,
-    gain: f32,
+    gain: Option<f32>,
     phase: f32,
 }
 
@@ -51,7 +51,7 @@ impl Default for PolyModSynth {
                         frequency: util::midi_note_to_freq(note),
                         velocity: 0.0,
                         pan: 0.0,
-                        gain: 1.0,
+                        gain: None,
                         phase: 0.0,
                     })
                 })
@@ -64,7 +64,7 @@ impl Default for PolyModSynthParams {
     fn default() -> Self {
         Self {
             gain: FloatParam::new(
-                "Gain",
+                "Note Gain",
                 1.0 / 128.0,
                 FloatRange::Skewed {
                     min: util::db_to_gain(-100.0),
@@ -188,7 +188,7 @@ impl Plugin for PolyModSynth {
                             } => {
                                 let voice =
                                     &mut self.voices[(channel as usize * 128) + note as usize];
-                                voice.gain = gain;
+                                voice.gain = Some(gain);
                             }
                             NoteEvent::PolyPan {
                                 timing: _,
@@ -249,7 +249,7 @@ impl Plugin for PolyModSynth {
             output[0][block_start..block_end].fill(0.0);
             output[1][block_start..block_end].fill(0.0);
 
-            let global_gain = self.params.gain.value();
+            let default_gain = self.params.gain.value();
 
             for voice in self.voices.iter_mut() {
                 if !voice.active {
@@ -265,7 +265,7 @@ impl Plugin for PolyModSynth {
                         0.0,
                     ));
 
-                    let amp = velocity_multiplier * voice.gain * global_gain;
+                    let amp = velocity_multiplier * voice.gain.unwrap_or(default_gain);
 
                     let sample = if sine_wave {
                         (voice.phase * TAU).sin()
@@ -310,7 +310,7 @@ impl PolyModSynth {
         voice.active = true;
         voice.velocity = 0.0;
         voice.pan = 0.0;
-        voice.gain = 1.0;
+        voice.gain = None;
 
         voice
     }
