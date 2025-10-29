@@ -1,5 +1,5 @@
 use nih_plug::{
-    midi::control_change::{POLY_MODE_ON, RESET_ALL_CONTROLLERS},
+    midi::control_change::{ALL_NOTES_OFF, POLY_MODE_ON, RESET_ALL_CONTROLLERS},
     prelude::*,
     util::db_to_gain,
 };
@@ -224,7 +224,10 @@ impl Plugin for PolyModSynth {
                                 cc,
                                 value: _,
                             } => {
-                                if cc == RESET_ALL_CONTROLLERS || cc == POLY_MODE_ON {
+                                if cc == RESET_ALL_CONTROLLERS
+                                    || cc == POLY_MODE_ON
+                                    || cc == ALL_NOTES_OFF
+                                {
                                     for note in 0..=127 {
                                         self.stop_voices(context, timing, channel, note);
                                     }
