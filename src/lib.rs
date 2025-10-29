@@ -36,9 +36,9 @@ impl Default for PolyModSynth {
     fn default() -> Self {
         Self {
             params: Arc::new(PolyModSynthParams::default()),
-            voices: (0..16)
+            voices: (0..=16)
                 .flat_map(|channel| {
-                    (0..127).map(move |note| Voice {
+                    (0..=127).map(move |note| Voice {
                         active: false,
                         note,
                         channel,
