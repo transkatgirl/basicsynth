@@ -287,7 +287,7 @@ impl Plugin for PolyModSynth {
                         voice.phase -= 1.0;
                     }
 
-                    let (left, right) = constant_power_pan(sample, pan);
+                    let (left, right) = constant_power_pan(sample, pan * 2.0);
 
                     output[0][sample_idx] += left;
                     output[1][sample_idx] += right;
@@ -355,7 +355,7 @@ fn constant_power_pan(value: f32, pan: f32) -> (f32, f32) {
     if pan == 0.0 {
         (value, value)
     } else {
-        let angle = (pan * 2.0 * 45.0).to_radians();
+        let angle = (pan * 45.0).to_radians();
         let coeff = f32::sqrt(2.0) / 2.0;
         let cos = f32::cos(angle);
         let sin = f32::sin(angle);
