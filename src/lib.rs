@@ -272,9 +272,11 @@ impl Plugin for PolyModSynth {
             output[0][block_start..block_end].fill(0.0);
             output[1][block_start..block_end].fill(0.0);
 
+            let global_gain = self.params.gain.value();
+
             for voice in self.voices.iter_mut().filter_map(|v| v.as_mut()) {
                 for sample_idx in block_start..block_end {
-                    let amp = voice.velocity_sqrt * voice.gain;
+                    let amp = voice.velocity_sqrt * voice.gain * global_gain;
                     let sample = (voice.phase * TAU).sin() * amp;
 
                     voice.phase += voice.phase_delta;
