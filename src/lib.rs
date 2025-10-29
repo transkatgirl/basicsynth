@@ -304,8 +304,8 @@ impl PolyModSynth {
     ) -> &mut Voice {
         let voice = &mut self.voices[(channel as usize * 128) + note as usize];
 
-        assert_eq!(voice.channel, channel);
-        assert_eq!(voice.note, note);
+        debug_assert_eq!(voice.channel, channel);
+        debug_assert_eq!(voice.note, note);
 
         voice.active = true;
         voice.velocities.clear();
@@ -323,8 +323,8 @@ impl PolyModSynth {
     ) {
         let voice = &mut self.voices[(channel as usize * 128) + note as usize];
 
-        assert_eq!(voice.channel, channel);
-        assert_eq!(voice.note, note);
+        debug_assert_eq!(voice.channel, channel);
+        debug_assert_eq!(voice.note, note);
 
         context.send_event(NoteEvent::VoiceTerminated {
             timing: sample_offset,
