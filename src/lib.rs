@@ -18,6 +18,8 @@ struct PolyModSynthParams {
     gain: FloatParam,
     #[id = "vrange"]
     velocity_range: FloatParam,
+    #[id = "sine"]
+    sine_wave: BoolParam,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +81,7 @@ impl Default for PolyModSynthParams {
             )
             .with_unit(" dB")
             .with_value_to_string(formatters::v2s_f32_rounded(2)),
+            sine_wave: BoolParam::new("Generate Sine Wave Output", true),
         }
     }
 }
@@ -131,6 +134,7 @@ impl Plugin for PolyModSynth {
         let sample_rate = context.transport().sample_rate;
         let output = buffer.as_slice();
 
+        let sine_wave = self.params.sine_wave.value();
         let velocity_range = self.params.velocity_range.value();
 
         let mut next_event = context.next_event();
@@ -271,7 +275,12 @@ impl Plugin for PolyModSynth {
                         db_to_gain(map_value_f32(velocity, 0.0, 1.0, -velocity_range, 0.0));
 
                     let amp = velocity_multiplier * gain * global_gain;
-                    let sample = (voice.phase * TAU).sin() * amp;
+
+                    let sample = if sine_wave {
+                        (voice.phase * TAU).sin()
+                    } else {
+                        (voice.phase * 2.0).round() - 1.0
+                    } * amp;
 
                     voice.phase += voice.frequency / sample_rate;
                     if voice.phase >= 1.0 {
