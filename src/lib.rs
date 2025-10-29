@@ -1,5 +1,5 @@
 use nih_plug::{prelude::*, util::db_to_gain};
-use std::{collections::VecDeque, f32::consts::TAU, sync::Arc};
+use std::{f32::consts::TAU, sync::Arc};
 
 // ! This needs a lot of code cleanup; many comments are incorrect
 
@@ -28,9 +28,9 @@ struct Voice {
     note: u8,
     channel: u8,
     frequency: f32,
-    velocities: VecDeque<(u32, f32)>,
-    pannings: VecDeque<(u32, f32)>,
-    gains: VecDeque<(u32, f32)>,
+    velocity: f32,
+    pan: f32,
+    gain: f32,
     phase: f32,
 }
 
@@ -45,9 +45,9 @@ impl Default for PolyModSynth {
                         note,
                         channel,
                         frequency: util::midi_note_to_freq(note),
-                        velocities: VecDeque::with_capacity(65535),
-                        pannings: VecDeque::with_capacity(65535),
-                        gains: VecDeque::with_capacity(65535),
+                        velocity: 0.0,
+                        pan: 0.0,
+                        gain: 1.0,
                         phase: 0.0,
                     })
                 })
@@ -162,10 +162,10 @@ impl Plugin for PolyModSynth {
                                 velocity,
                             } => {
                                 let voice = self.start_voice(context, timing, channel, note);
-                                voice.velocities.push_back((timing, velocity));
+                                voice.velocity = velocity;
                             }
                             NoteEvent::PolyPressure {
-                                timing,
+                                timing: _,
                                 voice_id: _,
                                 channel,
                                 note,
@@ -173,10 +173,10 @@ impl Plugin for PolyModSynth {
                             } => {
                                 let voice =
                                     &mut self.voices[(channel as usize * 128) + note as usize];
-                                voice.velocities.push_back((timing, pressure));
+                                voice.velocity = pressure;
                             }
                             NoteEvent::PolyVolume {
-                                timing,
+                                timing: _,
                                 voice_id: _,
                                 channel,
                                 note,
@@ -184,10 +184,10 @@ impl Plugin for PolyModSynth {
                             } => {
                                 let voice =
                                     &mut self.voices[(channel as usize * 128) + note as usize];
-                                voice.gains.push_back((timing, gain));
+                                voice.gain = gain;
                             }
                             NoteEvent::PolyPan {
-                                timing,
+                                timing: _,
                                 voice_id: _,
                                 channel,
                                 note,
@@ -195,7 +195,7 @@ impl Plugin for PolyModSynth {
                             } => {
                                 let voice =
                                     &mut self.voices[(channel as usize * 128) + note as usize];
-                                voice.pannings.push_back((timing, pan));
+                                voice.pan = pan;
                             }
                             NoteEvent::NoteOff {
                                 timing,
@@ -241,40 +241,15 @@ impl Plugin for PolyModSynth {
                 }
 
                 for sample_idx in block_start..block_end {
-                    while voice.gains.len() > 1 && voice.gains[1].0 > sample_idx as u32 {
-                        voice.gains.pop_front();
-                    }
+                    let velocity_multiplier = db_to_gain(map_value_f32(
+                        voice.velocity,
+                        0.0,
+                        1.0,
+                        -velocity_range,
+                        0.0,
+                    ));
 
-                    while voice.velocities.len() > 1 && voice.velocities[1].0 > sample_idx as u32 {
-                        voice.velocities.pop_front();
-                    }
-
-                    while voice.pannings.len() > 1 && voice.pannings[1].0 > sample_idx as u32 {
-                        voice.pannings.pop_front();
-                    }
-
-                    let gain = if !voice.gains.is_empty() {
-                        voice.gains[0].1
-                    } else {
-                        1.0
-                    };
-
-                    let velocity = if !voice.velocities.is_empty() {
-                        voice.velocities[0].1
-                    } else {
-                        1.0
-                    };
-
-                    let pan = if !voice.pannings.is_empty() {
-                        voice.pannings[0].1
-                    } else {
-                        0.0
-                    };
-
-                    let velocity_multiplier =
-                        db_to_gain(map_value_f32(velocity, 0.0, 1.0, -velocity_range, 0.0));
-
-                    let amp = velocity_multiplier * gain * global_gain;
+                    let amp = velocity_multiplier * voice.gain * global_gain;
 
                     let sample = if sine_wave {
                         (voice.phase * TAU).sin()
@@ -287,7 +262,7 @@ impl Plugin for PolyModSynth {
                         voice.phase -= 1.0;
                     }
 
-                    let (left, right) = constant_power_pan(sample, pan * 2.0);
+                    let (left, right) = constant_power_pan(sample, voice.pan * 2.0);
 
                     output[0][sample_idx] += left;
                     output[1][sample_idx] += right;
@@ -317,9 +292,9 @@ impl PolyModSynth {
         debug_assert_eq!(voice.note, note);
 
         voice.active = true;
-        voice.velocities.clear();
-        voice.pannings.clear();
-        voice.gains.clear();
+        voice.velocity = 0.0;
+        voice.pan = 0.0;
+        voice.gain = 1.0;
 
         voice
     }
