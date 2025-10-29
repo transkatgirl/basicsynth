@@ -1,4 +1,4 @@
-use nih_plug::prelude::*;
+use nih_plug::{prelude::*, util::db_to_gain};
 use std::{f32::consts::TAU, sync::Arc};
 
 // ! This needs a lot of code cleanup; many comments are incorrect
@@ -28,9 +28,10 @@ struct PolyModSynth {
 
 #[derive(Params)]
 struct PolyModSynthParams {
-    /// A voice's gain. This can be polyphonically modulated.
     #[id = "gain"]
     gain: FloatParam,
+    #[id = "vrange"]
+    velocity_range: FloatParam,
 }
 
 /// Data for a single synth voice. In a real synth where performance matter, you may want to use a
@@ -49,8 +50,8 @@ struct Voice {
     /// The voices internal ID. Each voice has an internal voice ID one higher than the previous
     /// voice. This is used to steal the last voice in case all 16 voices are in use.
     internal_voice_id: u64,
-    /// The square root of the note's velocity. This is used as a gain multiplier.
-    velocity_sqrt: f32,
+    /// This is used as a gain multiplier.
+    velocity_multiplier: f32,
 
     /// The voice's current phase.
     phase: f32,
@@ -79,20 +80,27 @@ impl Default for PolyModSynthParams {
         Self {
             gain: FloatParam::new(
                 "Gain",
-                util::db_to_gain(-12.0),
-                // Because we're representing gain as decibels the range is already logarithmic
-                FloatRange::Linear {
+                1.0 / NUM_VOICES as f32,
+                FloatRange::Skewed {
                     min: util::db_to_gain(-100.0),
                     max: util::db_to_gain(0.0),
+                    factor: FloatRange::gain_skew_factor(-100.0, 0.0),
                 },
             )
-            // This enables polyphonic mdoulation for this parameter by representing all related
-            // events with this ID. After enabling this, the plugin **must** start sending
-            // `VoiceTerminated` events to the host whenever a voice has ended.
             .with_poly_modulation_id(GAIN_POLY_MOD_ID)
             .with_unit(" dB")
             .with_value_to_string(formatters::v2s_f32_gain_to_db(2))
             .with_string_to_value(formatters::s2v_f32_gain_to_db()),
+            velocity_range: FloatParam::new(
+                "Velocity Range",
+                50.0,
+                FloatRange::Linear {
+                    min: 0.0,
+                    max: 100.0,
+                },
+            )
+            .with_unit(" dB")
+            .with_value_to_string(formatters::v2s_f32_rounded(2)),
         }
     }
 }
@@ -144,6 +152,8 @@ impl Plugin for PolyModSynth {
         let sample_rate = context.transport().sample_rate;
         let output = buffer.as_slice();
 
+        let velocity_range = self.params.velocity_range.value();
+
         let mut next_event = context.next_event();
         let mut block_start: usize = 0;
         let mut block_end: usize = MAX_BLOCK_SIZE.min(num_samples);
@@ -178,7 +188,13 @@ impl Plugin for PolyModSynth {
                                     channel,
                                     note,
                                 );
-                                voice.velocity_sqrt = velocity.sqrt();
+                                voice.velocity_multiplier = db_to_gain(map_value_f32(
+                                    velocity,
+                                    0.0,
+                                    1.0,
+                                    -velocity_range,
+                                    0.0,
+                                ));
                             }
                             NoteEvent::NoteOff {
                                 timing,
@@ -276,7 +292,7 @@ impl Plugin for PolyModSynth {
 
             for voice in self.voices.iter_mut().filter_map(|v| v.as_mut()) {
                 for sample_idx in block_start..block_end {
-                    let amp = voice.velocity_sqrt * voice.gain * global_gain;
+                    let amp = voice.velocity_multiplier * voice.gain * global_gain;
                     let sample = (voice.phase * TAU).sin() * amp;
 
                     voice.phase += voice.phase_delta;
@@ -323,7 +339,7 @@ impl PolyModSynth {
             internal_voice_id: self.next_internal_voice_id,
             channel,
             note,
-            velocity_sqrt: 1.0,
+            velocity_multiplier: 1.0,
 
             phase: 0.0,
             phase_delta: util::midi_note_to_freq(note) / sample_rate,
@@ -405,6 +421,10 @@ impl PolyModSynth {
             }
         }
     }
+}
+
+pub fn map_value_f32(x: f32, min: f32, max: f32, target_min: f32, target_max: f32) -> f32 {
+    (x - min) / (max - min) * (target_max - target_min) + target_min
 }
 
 /// Compute a voice ID in case the host doesn't provide them. Polyphonic modulation will not work in
