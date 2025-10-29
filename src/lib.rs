@@ -1,4 +1,8 @@
-use nih_plug::{prelude::*, util::db_to_gain};
+use nih_plug::{
+    midi::control_change::{POLY_MODE_ON, RESET_ALL_CONTROLLERS},
+    prelude::*,
+    util::db_to_gain,
+};
 use std::{f32::consts::TAU, sync::Arc};
 
 // ! This needs a lot of code cleanup; many comments are incorrect
@@ -213,6 +217,18 @@ impl Plugin for PolyModSynth {
                                 note,
                             } => {
                                 self.stop_voices(context, timing, channel, note);
+                            }
+                            NoteEvent::MidiCC {
+                                timing,
+                                channel,
+                                cc,
+                                value: _,
+                            } => {
+                                if cc == RESET_ALL_CONTROLLERS || cc == POLY_MODE_ON {
+                                    for note in 0..=127 {
+                                        self.stop_voices(context, timing, channel, note);
+                                    }
+                                }
                             }
                             _ => (),
                         };
